@@ -6,10 +6,11 @@ import numpy as np
 import base64
 import io
 from PIL import Image
+import cubo
+import xarray as xr
 
 app = FastAPI(title="Landslide Detection API - La Convención")
 
-# Habilitar CORS para permitir peticiones desde tu app estática en Hugging Face
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], 
@@ -18,8 +19,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Cargar los modelos ONNX desde la misma carpeta
-# onnxruntime automáticamente detectará los archivos .data asociados
 print("Cargando modelos ONNX...")
 unet_session = ort.InferenceSession("unet_landslide.onnx", providers=["CPUExecutionProvider"])
 deeplab_session = ort.InferenceSession("deeplabv3_landslide.onnx", providers=["CPUExecutionProvider"])
@@ -30,6 +29,54 @@ class ROIRequest(BaseModel):
     lon: float
     date: str
 
+def fetch_real_satellite_tensor(lat: float, lon: float, date_str: str, edge: int = 256):
+    """Descarga Sentinel-2 y DEM, calcula la pendiente y concatena en 6 canales."""
+    
+    # 1. Extraer Sentinel-2 (B01, B02, B03, B04)
+    # cubo devuelve dimensiones (time, band, y, x)
+    s2 = cubo.create(
+        lat=lat,
+        lon=lon,
+        collection="sentinel-2-l2a",
+        bands=["B01", "B02", "B03", "B04"],
+        start_date=date_str,
+        end_date=date_str,
+        edge_size=edge,
+        resolution=10
+    )
+    # Normalización estándar para imágenes ópticas (0 a 1)
+    s2_np = s2.values / 10000.0 
+    
+    # 2. Extraer DEM (Usamos cop-dem-glo-30 como proveedor STAC estándar de elevación)
+    dem = cubo.create(
+        lat=lat,
+        lon=lon,
+        collection="cop-dem-glo-30",
+        bands=["data"], # Elevación pura
+        edge_size=edge,
+        resolution=10
+    )
+    dem_np = dem.values # Dimensiones (1, 1, 256, 256)
+    
+    # 3. Calcular la Pendiente (Slope) a partir del DEM usando gradientes espaciales
+    # Eliminamos las dimensiones sobrantes temporalmente para calcular el gradiente
+    dem_2d = dem_np.squeeze() 
+    dy, dx = np.gradient(dem_2d)
+    slope_2d = np.sqrt(dx**2 + dy**2)
+    # Restaurar dimensiones para la concatenación (1, 1, 256, 256)
+    slope_np = np.expand_dims(np.expand_dims(slope_2d, axis=0), axis=0) 
+    
+    # 4. Concatenar S2(4), Slope(1), DEM(1) -> Tensor Final (1, 6, 256, 256)
+    tensor_input = np.concatenate([s2_np, slope_np, dem_np], axis=1).astype(np.float32)
+    
+    # 5. Extraer coordenadas límite (Bounding Box) reales para proyectar en Leaflet
+    bbox = [
+        [float(s2.y.min()), float(s2.x.min())],
+        [float(s2.y.max()), float(s2.x.max())]
+    ]
+    
+    return tensor_input, bbox
+
 @app.get("/")
 def read_root():
     return {"message": "API de Detección de Deslizamientos Activa"}
@@ -37,33 +84,31 @@ def read_root():
 @app.post("/predict")
 def predict_landslide(request: ROIRequest):
     try:
-        # AQUI SE INTEGRARÁ 'cubo' PARA DESCARGAR SATÉLITE REAL.
-        # Por ahora, simularemos la matriz (1, 6, 256, 256) que enviaría cubo.
-        dummy_tensor = np.random.randn(1, 6, 256, 256).astype(np.float32)
+        # Llamada a la función real de extracción
+        tensor_input, bbox = fetch_real_satellite_tensor(
+            lat=request.lat, 
+            lon=request.lon, 
+            date_str=request.date
+        )
         
-        # Obtener el nombre de la capa de entrada del ONNX
         input_name = unet_session.get_inputs()[0].name
         
-        # Realizar la inferencia con U-Net
-        prediction = unet_session.run(None, {input_name: dummy_tensor})[0]
+        # Inferencia con U-Net (tensor de 6 canales reales)
+        prediction = unet_session.run(None, {input_name: tensor_input})[0]
         
-        # Aplicar Sigmoide y binarizar (simulando detección)
+        # Sigmoide y binarización
         sigmoid_pred = 1 / (1 + np.exp(-prediction))
         mask = (sigmoid_pred > 0.5).astype(np.uint8).squeeze()
         
-        # Convertir la matriz numpy (0 y 1) a una imagen de mapa de bits (0 y 255)
-        # y pintarla en rojo transparente para el mapa
+        # Capa roja transparente para zonas de peligro
         mask_visual = np.zeros((256, 256, 4), dtype=np.uint8)
-        mask_visual[mask == 1] = [255, 0, 0, 150] # RGBA: Rojo con transparencia
+        mask_visual[mask == 1] = [255, 0, 0, 150] 
         
-        # Codificar en Base64
+        # Conversión a Base64
         img = Image.fromarray(mask_visual, mode="RGBA")
         buffered = io.BytesIO()
         img.save(buffered, format="PNG")
         img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
-        
-        # Simulamos los límites geográficos del parche extraído
-        bbox = [[request.lat - 0.02, request.lon - 0.02], [request.lat + 0.02, request.lon + 0.02]]
         
         return {
             "status": "success", 
@@ -72,4 +117,4 @@ def predict_landslide(request: ROIRequest):
             "model": "U-Net"
         }
     except Exception as e:
-        return {"status": "error", "message": str(e)}g
+        return {"status": "error", "message": str(e)}
