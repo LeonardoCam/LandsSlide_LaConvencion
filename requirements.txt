@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+cubo
+xarray
+rioxarray
+onnxruntime
+numpy
+pydantic
+Pillow
